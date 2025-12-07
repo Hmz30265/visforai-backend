@@ -1,4 +1,4 @@
-from decoder import decoder_prediction
+from model import vfhnn, decoder_prediction
 import importlib.util
 import os
 import numpy as np
@@ -12,7 +12,7 @@ def load_config_from_py(config_path):
     return config
 
 
-def load_model(model_dir, device):
+def load_model(model_dir, device): # TODO: load encoder as well this time
     '''
         Loads model and config file from model_dir 
     '''
@@ -23,7 +23,17 @@ def load_model(model_dir, device):
     hidden_size = getattr(config, "hidden_size", 6)
     output_size = getattr(config, "output_size", 8)
     dropout = getattr(config, "dropout", 0)
+    enc_dim_list = getattr(config, "enc_dim_list", [7, 2])
     input_shape = 76
+
+    encoder = vfhnn(
+        input_channels=input_shape,
+        hidden_size=hidden_size,
+        output_channels=output_size,
+        target_length=target_length,
+        dropout=dropout,
+        enc_dim_list=enc_dim_list,
+        device=device).to(device)
 
     decoder = decoder_prediction(
         input_channels=input_shape,
@@ -34,10 +44,13 @@ def load_model(model_dir, device):
         device=device).to(device)
     
     ckpt_path = os.path.join(model_dir, "all_finetuned_vfhnn")
+    encoder.load_state_dict(torch.load(ckpt_path, map_location=device)[0][0])
     decoder.load_state_dict(torch.load(ckpt_path, map_location=device)[0][1])
+    
+    encoder.to(device).eval()
     decoder.to(device).eval()
 
-    return decoder, config, device
+    return encoder, decoder, config, device
 
 def get_model_latent(site_ids, base_path, num_layers=3):
     '''
@@ -66,7 +79,7 @@ def get_model_latent(site_ids, base_path, num_layers=3):
             print(f"Warning: File not found for site {site_id}")
             continue
 
-        mu = np.load(file_path)["mu"]  # shape: (T, S, L, H)
+        mu = np.load(file_path)["mu"]  # shape: (layers, site, forecast_steps, hidden_size)
         mu = mu.squeeze()[:min_steps]
 
         logvar = np.load(file_path)["logvar"]
@@ -80,7 +93,19 @@ def get_model_latent(site_ids, base_path, num_layers=3):
     all_layer_logvar = np.stack(all_layer_logvar)
     print(all_layer_mu.shape, all_layer_logvar.shape)
     
-    return all_layer_mu, all_layer_logvar
+    return all_layer_mu, all_layer_logvar, min_steps
 
 def get_activity_latent(all_layer_mu):
     return  np.var(all_layer_mu, axis=(1, 2))
+
+def sample_latent_dim_per_req(mu_list, logvar_list, layer_idx, dim_idx, offset):    
+    std_dev = np.exp(logvar_list[layer_idx][:, :, dim_idx] / 2)    
+    shifted_mu = mu_list[layer_idx, :, :, dim_idx] + offset * std_dev 
+    print("Original μ:", mu_list)
+    print("Shifted μ:", shifted_mu)
+    print("Difference:", (shifted_mu - mu_list[layer_idx, :, :, dim_idx]).mean())
+    modified_mu = mu_list.copy() 
+    modified_mu[layer_idx, :, :, dim_idx] = shifted_mu
+    
+    return modified_mu, logvar_list
+

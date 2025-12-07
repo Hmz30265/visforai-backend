@@ -3,43 +3,65 @@ from flask_cors import CORS
 import numpy as np
 import torch
 import os
-from model_utils import load_model, get_model_latent, get_activity_latent
-from site_information import forecast_sites
+from model_utils import load_model, get_model_latent, get_activity_latent, sample_latent_dim_per_req
+from dataset_utils import forecast_data_prep
+from model import VFHNN_ensemble_forecast
+from site_information import forecast_sites, sites_70
 
 app = Flask(__name__)
 CORS(app)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Load your PyTorch model
-data_dir = "models/vfhnn_beta_1"
+data_dir = "models/vfhnn_decoder-mean-var"
 sites_rmse_cache = {}  # simple in-memory cache: site_str -> rmse_list
 forecast_cache = {} 
-decoder, config, device = load_model(data_dir, device)
+encoder, decoder, config, device = load_model(data_dir, device)
+norms_Y = np.load("forecast_data/norm_information.npz", allow_pickle=True)["norms_Y"]
 
-@app.route("/")
-def home():
-    return "Hello from Fly.io!"
+mu, logvar, min_steps = get_model_latent(forecast_sites, data_dir)  # (num_layers, num_sites, time_steps, hidden_size)
+var = np.exp(logvar)  # logvar to variance
+
+def get_mu_logvar():
+    return mu, logvar
 
 @app.route("/api/latent_activity", methods=["POST"])
 def latent_activity():
-    mu, logvar = get_model_latent(forecast_sites, data_dir)  # shape: (num_layers, ...)
+    mu, logvar = get_mu_logvar()  # shape: (num_layers, num_sites, time_steps, hidden_size)
     var = np.exp(logvar)  # convert logvar to actual variance
 
     # activity can still be variance across time/dim
     activity = get_activity_latent(mu)
 
-    # Prepare data for frontend traversal: send mean and std per latent
-    # For simplicity, we can return mean and std per latent dimension for each layer
-    # Here we collapse time dimension if needed (take mean over time axis 0)
+    # Prepare data for frontend
     latent_info = []
     for layer_idx in range(mu.shape[0]):
-        layer_means = mu[layer_idx].mean(axis=0).tolist()       # mean across time
-        layer_stds = np.sqrt(var[layer_idx].mean(axis=0)).tolist()  # std across time
-        latent_info.append({"mean": layer_means, "std": layer_stds})
+        # mu[layer_idx] shape: (num_sites, time_steps, hidden_size)
+        layer_mu = mu[layer_idx]  # (num_sites, time_steps, hidden_size)
+        layer_var = var[layer_idx]  # (num_sites, time_steps, hidden_size)
+        
+        # Flatten across sites and time to get all values per latent dim
+        # Reshape to (num_sites * time_steps, hidden_size)
+        flattened_mu = layer_mu.reshape(-1, layer_mu.shape[-1])  # (N, hidden_size)
+        flattened_var = layer_var.reshape(-1, layer_var.shape[-1])  # (N, hidden_size)
+        
+        # Compute mean and std across all samples for each latent dimension
+        layer_means = flattened_mu.mean(axis=0).tolist()  # (hidden_size,)
+        layer_stds = np.sqrt(flattened_var.mean(axis=0)).tolist()  # (hidden_size,)
+        
+        # For allMeans, we need a list per latent dimension containing all values
+        # Transpose so we get (hidden_size, N) then convert to list of lists
+        all_means_per_dim = flattened_mu.T.tolist()  # (hidden_size, N) -> [[dim0_vals], [dim1_vals], ...]
+        
+        latent_info.append({
+            "mean": layer_means, 
+            "std": layer_stds, 
+            "allMeans": all_means_per_dim  # list of lists, one per latent dim
+        })
 
     return jsonify({
         "activity": activity.tolist(),
-        "latent_info": latent_info  # send mean/std for slider traversal
+        "latent_info": latent_info
     })
 
 @app.route("/api/site_rmse_image", methods=["GET"])
@@ -64,6 +86,34 @@ def site_rmse_image():
         if os.path.exists(alt_path):
             return send_file(alt_path, mimetype="image/png")
         return jsonify({"error": "rmse image not found for site"}), 404
+
+@app.route("/api/inference", methods=["POST"])
+def run_inference():
+    # Get the data sent from the frontend
+    data = request.get_json()
+    site_idx = data['site_idx']  # Selected site
+    layer_idx = data['layer']  # Layer selected by user
+    dim_idx = data['dim']  # Latent dimension index selected by user
+    offset = data['offset']  # Offset value provided by user
+    
+    # Get the mu and logvar distributions (assumed you have a function to load them)
+    mu, logvar = get_mu_logvar() 
+    shifted_mu, logvar = sample_latent_dim_per_req(mu, logvar, layer_idx, dim_idx, offset)
+
+    # the correct mu and var is based on forecast site index
+    site_position = forecast_sites.index(site_idx)
+    shifted_mu = shifted_mu[:, site_position, :, :]  # (num_layers, time_steps, hidden_size)
+    logvar = logvar[:, site_position, :, :]  # (num_layers, time_steps, hidden_size)
+
+    forecast_dataset = forecast_data_prep(site_idx=site_idx, sites=sites_70, num_sites=len(sites_70.keys()), sequence_length=config.sequence_length, prediction_length=config.prediction_length)
+    pred_c_degree = VFHNN_ensemble_forecast(encoder, decoder, forecast_dataset, norms_Y, shifted_mu, logvar, min_steps, prediction_length=8, device=device)
+    
+    predictions = pred_c_degree['pred'].mean(axis=1).tolist()[:min_steps]  # average over z samples 
+    # Return the prediction for the specific site
+    return jsonify({
+        "shifted_pred": predictions  # Return the prediction for the selected site
+    })
+
 
 @app.route("/api/sites_rmse", methods=["GET"])
 def sites_rmse():
@@ -315,6 +365,7 @@ def site_forecast():
             target_vec = y_true[:, lead_i].tolist()
             return jsonify({"site": site_str, "lead": lead_i + 1, "pred": pred_vec, "target": target_vec, "horizon": horizon})
 
+        print(y_pred.shape, y_true.shape)
         # otherwise return full arrays (careful: may be larger)
         return jsonify({"site": site_str, "lead": None, "pred": y_pred.tolist(), "target": y_true.tolist(), "horizon": horizon})
 
@@ -326,6 +377,4 @@ def get_forecast_sites():
     return jsonify({"sites": forecast_sites})
 
 if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    app.run(debug=True)
