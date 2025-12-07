@@ -16,6 +16,10 @@ sites_rmse_cache = {}  # simple in-memory cache: site_str -> rmse_list
 forecast_cache = {} 
 decoder, config, device = load_model(data_dir, device)
 
+@app.route("/")
+def home():
+    return "Hello from Fly.io!"
+
 @app.route("/api/latent_activity", methods=["POST"])
 def latent_activity():
     mu, logvar = get_model_latent(forecast_sites, data_dir)  # shape: (num_layers, ...)
@@ -322,4 +326,6 @@ def get_forecast_sites():
     return jsonify({"sites": forecast_sites})
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    import os
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
